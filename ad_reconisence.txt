@@ -1,0 +1,92 @@
+#!/bin/bash
+
+# ===============================================
+# Advanced Recon Automation Script (Rapyd-Ready)
+# ===============================================
+
+source rapyd.env
+
+domain=$1
+threads=50
+timestamp=$(date +%Y%m%d_%H%M%S)
+outdir="${domain}-${timestamp}"
+
+mkdir -p "$outdir"/{subs,live,urls,ports,js,nuclei,xss,screenshots,report,cves,ssrf,chatbot}
+
+echo "[+] Subdomain Enumeration"
+subfinder -d "$domain" -silent -o "$outdir/subs/all.txt"
+
+echo "[+] Live Host Detection"
+httpx -l "$outdir/subs/all.txt" -silent -threads $threads -o "$outdir/live/live.txt"
+
+echo "[+] Crawling URLs"
+gau "$domain" | tee "$outdir/urls/all.txt"
+
+echo "[+] Port Scanning"
+naabu -l "$outdir/live/live.txt" -top-ports 100 -silent -o "$outdir/ports/naabu.txt"
+
+echo "[+] Discovering JavaScript Files"
+katana -list "$outdir/live/live.txt" -jsl -silent -o "$outdir/js/jsfiles.txt"
+
+echo "[+] JS Secret Scanning"
+> "$outdir/js/secrets.txt"
+while read jsurl; do
+  echo "[*] $jsurl" >> "$outdir/js/secrets.txt"
+  trufflehog url "$jsurl" >> "$outdir/js/secrets.txt" 2>/dev/null
+done < "$outdir/js/jsfiles.txt"
+
+echo "[+] Starting Nuclei Scan in Background..."
+nuclei -l "$outdir/live/live.txt"        -severity critical,high,medium,low,info        -silent -o "$outdir/nuclei/nuclei.txt" &
+nuclei_pid=$!
+echo "[*] Nuclei running in background (PID $nuclei_pid)"
+
+echo "[+] CVE Scanning"
+nuclei -l "$outdir/live/live.txt" -t cves/ -severity critical,high -o "$outdir/cves/cve.txt"
+
+echo "[+] Dalfox XSS Scan"
+gf xss < "$outdir/urls/all.txt" | dalfox pipe -o "$outdir/xss/results.txt"
+
+echo "[+] SSRF Fuzzing"
+cat "$outdir/urls/all.txt" | qsreplace 'http://127.0.0.1' | ffuf -c -u FUZZ -w - -mc 200,403,500 -t $threads -o "$outdir/ssrf/ssrf.txt"
+
+# API detection
+if grep -q 'api.rapyd.net' "$outdir/live/live.txt"; then
+  echo "[+] Detected Rapyd API. Running authenticated call."
+  api_host="https://api.rapyd.net/v1/user"
+  method="get"
+  path="/v1/user"
+  body=""
+  sigdata=$(./generate_rapyd_signature.sh "$method" "$path" "$body")
+  signature=$(echo "$sigdata" | cut -d'|' -f1)
+  salt=$(echo "$sigdata" | cut -d'|' -f2)
+  timestamp=$(echo "$sigdata" | cut -d'|' -f3)
+  curl -s "$api_host"     -H "Content-Type: application/json"     -H "access_key: $RAPYD_ACCESS_KEY"     -H "salt: $salt"     -H "timestamp: $timestamp"     -H "signature: $signature" > "$outdir/rapyd_api_response.json"
+fi
+
+echo "[+] Screenshotting"
+cat "$outdir/nuclei/nuclei.txt" "$outdir/cves/cve.txt" "$outdir/xss/results.txt" "$outdir/ssrf/ssrf.txt" | grep -Eo 'http[s]?://[^ ]+' | sort -u > "$outdir/vuln-urls.txt"
+gowitness file -f "$outdir/vuln-urls.txt" --destination "$outdir/screenshots" --timeout 10
+
+echo "[*] Waiting for Nuclei to finish..."
+wait $nuclei_pid
+
+echo "[+] Generating Markdown Report"
+report="$outdir/report/report.md"
+touch "$report"
+{
+echo "# Recon Report for $domain"
+echo "_Date: $(date)_"
+echo "## Subdomains"; wc -l < "$outdir/subs/all.txt"
+echo "## Open Ports"; cat "$outdir/ports/naabu.txt" || echo "None"
+echo "## CVEs"; cat "$outdir/cves/cve.txt" || echo "None"
+echo "## SSRF"; cat "$outdir/ssrf/ssrf.txt" || echo "None"
+echo "## XSS"; cat "$outdir/xss/results.txt" || echo "None"
+echo "## JS Secrets"; grep -Ei "key|token|secret|aws" "$outdir/js/secrets.txt" || echo "None"
+echo "## Screenshots"
+for img in "$outdir/screenshots"/*.png; do [ -e "$img" ] && echo "![Screenshot]($img)"; done
+} >> "$report"
+
+echo "[+] Creating PDF Report"
+pandoc "$report" -o "$outdir/final_report.pdf" --from markdown --pdf-engine=xelatex
+
+echo "[✓] Recon Complete → $outdir/final_report.pdf"
